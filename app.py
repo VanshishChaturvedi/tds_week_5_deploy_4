@@ -62,7 +62,8 @@ async def endpoint_sse_get(request: Request):
             mcp_server.create_initialization_options()
         )
 
-@app.route("/sse", methods=["POST", "HEAD"])
+# FIX: Use @app.api_route for FastAPI instead of @app.route
+@app.api_route("/sse", methods=["POST", "HEAD"])
 async def endpoint_sse_ping(request: Request):
     """Handles the initial validation pings from the grader directly on the /sse URL."""
     return Response(status_code=200)

@@ -1,20 +1,25 @@
 import hashlib
-import contextvars
+import json
 import os
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 from mcp.server.sse import SseServerTransport
 import uvicorn
 
-# Context variable to hold the HTTP header across the async request lifecycle
-challenge_var = contextvars.ContextVar("challenge", default="")
-
-# Initialize FastAPI and the MCP Server
 app = FastAPI(title="Exam MCP Server")
-mcp_server = Server("exam-server")
 
-# The EXACT registered exam email required by the grader
+# 1. Enable CORS for the grader (required if the grader uses a web UI)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+mcp_server = Server("exam-server")
 EMAIL = "24f2003215@ds.study.iitm.ac.in"
 
 @mcp_server.list_tools()
@@ -35,30 +40,21 @@ async def handle_call_tool(name: str, arguments: dict) -> list[TextContent]:
     if name != "solve_challenge":
         raise ValueError(f"Unknown tool: {name}")
     
-    # Read the fresh challenge from the HTTP headers via the context variable
-    challenge = challenge_var.get()
+    # Extract the challenge we safely injected from the HTTP headers
+    challenge = arguments.get("_challenge_header", "")
     
     # Format: ${challenge}:${normalizedEmail}
     text_to_hash = f"{challenge}:{EMAIL}"
-    
-    # Generate SHA-256 hash and extract the first 16 lowercase hex characters
     hash_hex = hashlib.sha256(text_to_hash.encode("utf-8")).hexdigest()[:16]
     
-    # Return as a single MCP text content block
     return [TextContent(type="text", text=hash_hex)]
 
-# Setup the standard MCP SSE Transport
-# We bind the messages endpoint to /sse to match the grader's URL validation
-sse = SseServerTransport("/sse")
-
-@app.get("/")
-async def root():
-    """Returns a 200 OK if the grader pings the root domain."""
-    return {"status": "Server is live"}
+# 2. Standard MCP transport setup routing JSON-RPC POSTs to /messages
+sse = SseServerTransport("/messages")
 
 @app.get("/sse")
 async def endpoint_sse_get(request: Request):
-    """Handles the initial MCP SSE connection (GET)."""
+    """Handles the initial MCP SSE connection."""
     async with sse.connect_sse(request.scope, request.receive, request._send) as streams:
         await mcp_server.run(
             streams[0],
@@ -66,22 +62,45 @@ async def endpoint_sse_get(request: Request):
             mcp_server.create_initialization_options()
         )
 
-@app.post("/sse")
-async def endpoint_sse_post(request: Request):
-    """Handles the JSON-RPC tool calls OR validation pings from the grader (POST)."""
-    # Extract the X-Exam-Challenge header
+@app.route("/sse", methods=["POST", "HEAD"])
+async def endpoint_sse_ping(request: Request):
+    """Handles the initial validation pings from the grader directly on the /sse URL."""
+    return Response(status_code=200)
+
+@app.post("/messages")
+async def endpoint_messages(request: Request):
+    """Handles JSON-RPC messages and safely extracts HTTP headers without hanging ASGI."""
+    # Read the challenge from the header
     challenge = request.headers.get("X-Exam-Challenge", "")
     
-    # Inject it into the async context so handle_call_tool can read it
-    challenge_var.set(challenge)
-    
-    # The grader sends a POST request to validate the URL before initiating SSE.
-    # If there is no sessionId in the query parameters, it's just a validation ping.
-    if "sessionId" not in request.query_params:
-        return {"status": "URL valid"}
+    # Consume the body safely
+    body_bytes = await request.body()
+    try:
+        data = json.loads(body_bytes)
+        # If it is a tool call, inject the header directly into the JSON arguments
+        # so the isolated tool execution context can access it cleanly.
+        if isinstance(data, dict) and data.get("method") == "tools/call":
+            if "params" not in data:
+                data["params"] = {}
+            if "arguments" not in data["params"]:
+                data["params"]["arguments"] = {}
+            data["params"]["arguments"]["_challenge_header"] = challenge
         
-    # Hand off the request to the MCP transport to process the JSON-RPC body
-    await sse.handle_post_message(request.scope, request.receive, request._send)
+        modified_body = json.dumps(data).encode("utf-8")
+    except Exception:
+        # Fallback if parsing fails for any reason
+        modified_body = body_bytes
+
+    # Reconstruct the ASGI stream state to prevent the transport from timing out
+    received = False
+    async def mock_receive():
+        nonlocal received
+        if not received:
+            received = True
+            return {"type": "http.request", "body": modified_body, "more_body": False}
+        return {"type": "http.disconnect"}
+        
+    await sse.handle_post_message(request.scope, mock_receive, request._send)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
